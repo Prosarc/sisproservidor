@@ -35,6 +35,20 @@ class VerificarPagoWati implements ShouldQueue
         private int     $diasMargen = 0,
     ) {}
 
+    /** BSUID de WhatsApp, p. ej. CO.1787416719197505 (contactos sin teléfono visible). */
+    public static function esBsuid(string $id): bool
+    {
+        return (bool) preg_match('/^[A-Za-z]{2}\.\d+$/', trim($id));
+    }
+
+    /** Clave segura para nombres de archivo/carpeta: dígitos para teléfonos, BSUID tal cual. */
+    public static function claveIdentificador(string $id): string
+    {
+        $id = trim($id);
+
+        return self::esBsuid($id) ? $id : preg_replace('/\D/', '', $id);
+    }
+
     public function handle(): void
     {
         $endpoint = config('services.wati.endpoint');
@@ -99,6 +113,11 @@ class VerificarPagoWati implements ShouldQueue
             'factura_valida' => $facturaValida,
             'comprobante'    => $rutaComprobante,
             'ocr_metodo'     => $ocr['metodo'] ?? 'ocr',
+            'monto_esperado' => $this->monto,
+            'valor'          => $valorExtraido,
+            'monto_valido'   => $montoValido,
+            'prosarc_valido' => $prosarcValido,
+            'ocr_texto'      => mb_substr(preg_replace('/\s+/u', ' ', $texto), 0, 300),
         ]);
     }
 
@@ -267,7 +286,7 @@ class VerificarPagoWati implements ShouldQueue
 
     private function guardarComprobante(string $contenido, string $nombreArchivo): string
     {
-        $phone   = preg_replace('/\D/', '', $this->numberPhone);
+        $phone   = self::claveIdentificador($this->numberPhone);
         $ahora   = now();
         $carpeta = public_path('comprobantes/' . $phone . '/' . $ahora->year . '/' . str_pad($ahora->month, 2, '0', STR_PAD_LEFT));
 
@@ -291,7 +310,7 @@ class VerificarPagoWati implements ShouldQueue
         $carpeta = storage_path('app/verificaciones');
         if (!file_exists($carpeta)) mkdir($carpeta, 0755, true);
 
-        $archivo = $carpeta . '/' . preg_replace('/\D/', '', $this->numberPhone) . '.json';
+        $archivo = $carpeta . '/' . self::claveIdentificador($this->numberPhone) . '.json';
 
         // No sobreescribir un resultado exitoso con un error
         if (isset($resultado['error']) && file_exists($archivo)) {
@@ -314,6 +333,10 @@ class VerificarPagoWati implements ShouldQueue
                 'token_definido'    => trim($token) !== '',
             ]);
             return [null, null];
+        }
+
+        if (self::esBsuid($this->numberPhone)) {
+            return $this->descargarUltimoArchivoV3($token);
         }
 
         $pageNumber = 1;
@@ -390,6 +413,74 @@ class VerificarPagoWati implements ShouldQueue
             }
 
             $pageNumber++;
+        }
+
+        if ($this->ultimoErrorDescarga === null) {
+            $this->ultimoErrorDescarga = 'No se encontró ningún archivo reciente. Verifica que el comprobante se haya enviado como imagen o documento.';
+        }
+
+        return [null, null];
+    }
+
+    /** Contactos sin teléfono: mensajes y archivo por la API v3, usando el BSUID como target. */
+    private function descargarUltimoArchivoV3(string $token): array
+    {
+        $target = trim($this->numberPhone);
+        $base   = WatiMediaService::baseV3();
+
+        for ($pagina = 1; $pagina <= 5; $pagina++) {
+            $response = Http::withoutVerifying()
+                ->withToken($token)
+                ->timeout(30)
+                ->get($base . '/api/ext/v3/conversations/' . rawurlencode($target) . '/messages', [
+                    'page_number' => $pagina,
+                    'page_size'   => 20,
+                ]);
+
+            if (!$response->successful()) {
+                Log::warning('Wati v3 messages falló en verificación de pago', [
+                    'target' => $target,
+                    'pagina' => $pagina,
+                    'status' => $response->status(),
+                    'body'   => mb_substr($response->body(), 0, 300),
+                ]);
+
+                if (in_array($response->status(), [401, 403], true)) {
+                    $this->ultimoErrorDescarga = 'No fue posible consultar WATI: token o endpoint no autorizado.';
+                } elseif ($response->status() >= 500) {
+                    $this->ultimoErrorDescarga = 'WATI no respondió correctamente al consultar los mensajes.';
+                }
+                break;
+            }
+
+            $mensajes = $response->json('message_list') ?? [];
+            if (empty($mensajes)) {
+                break;
+            }
+
+            foreach ($mensajes as $message) {
+                if (($message['event_type'] ?? 'message') !== 'message') continue;
+                if (($message['owner'] ?? false) === true) continue;
+
+                $type = strtolower((string) ($message['type'] ?? ''));
+                $id   = (string) ($message['id'] ?? '');
+                if (!in_array($type, ['image', 'document'], true) || $id === '') continue;
+
+                $textoNombre = (string) ($message['text'] ?? '');
+                if (str_contains(strtolower($textoNombre), '.crdownload')) continue;
+
+                $descarga = WatiMediaService::downloadV3($id, $textoNombre, $type);
+                if (!$descarga) {
+                    continue;
+                }
+
+                $ext = $descarga['extension'];
+                $nombreArchivo = ($textoNombre && preg_match('/\.\w{2,4}$/i', $textoNombre))
+                    ? preg_replace('/[^a-zA-Z0-9_\-]/', '_', pathinfo($textoNombre, PATHINFO_FILENAME)) . '.' . $ext
+                    : 'comprobante_' . time() . '.' . $ext;
+
+                return [$descarga['content'], $nombreArchivo];
+            }
         }
 
         if ($this->ultimoErrorDescarga === null) {

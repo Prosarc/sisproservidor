@@ -14,19 +14,24 @@ class VerificarPagoController extends Controller
 {
     public function verificar(Request $request)
     {
-        $numberPhone = $request->input('numberPhone');
+        $bsuid       = trim((string) $request->input('bsuid'));
+        $telefono    = trim((string) $request->input('numberPhone'));
+        // WATI deja la variable literal ({{BSUID}}) cuando el contacto no la tiene
+        $esVacio     = fn (string $v) => $v === '' || (bool) preg_match('/^\{\{.*\}\}$|^@/', $v);
+        $numberPhone = !$esVacio($bsuid) ? $bsuid : (!$esVacio($telefono) ? $telefono : null);
         $monto       = $request->input('monto');
         // Margen de días aceptado para la fecha del comprobante (0 = solo hoy)
         $diasMargen  = (int) $request->input('diasMargen', 30);
 
-        if (!$numberPhone) {
-            return response()->json(['error' => 'numberPhone es requerido'], 422);
-        }
-
         Log::info('VerificarPago iniciado', ['phone' => $numberPhone, 'monto' => $monto, 'diasMargen' => $diasMargen]);
 
+        if (!$numberPhone) {
+            Log::warning('VerificarPago: falta numberPhone y bsuid', ['body' => array_keys($request->all())]);
+            return response()->json(['error' => 'numberPhone o bsuid es requerido'], 422);
+        }
+
         // Nuevo ciclo de verificación: limpiar marcador y resultado anterior
-        $phoneLimpio = preg_replace('/\D/', '', $numberPhone);
+        $phoneLimpio = VerificarPagoWati::claveIdentificador($numberPhone);
         $marcador    = storage_path('app/verificaciones/' . $phoneLimpio . '.saved');
         $resultado   = storage_path('app/verificaciones/' . $phoneLimpio . '.json');
         if (file_exists($marcador)) {
@@ -48,7 +53,7 @@ class VerificarPagoController extends Controller
         // se acepte o se rechace el pago. Usa el mismo flujo que el endpoint de documentos.
         $this->guardarComprobantes($request, $phone);
 
-        $archivo = storage_path('app/verificaciones/' . preg_replace('/\D/', '', $phone) . '.json');
+        $archivo = storage_path('app/verificaciones/' . VerificarPagoWati::claveIdentificador($phone) . '.json');
 
         if (!file_exists($archivo)) {
             return response()->json([
@@ -100,7 +105,7 @@ class VerificarPagoController extends Controller
     {
         try {
             // Idempotencia: solo guardar una vez por ciclo de verificación (resultado-pago es polleado)
-            $phoneLimpio = preg_replace('/\D/', '', $phone);
+            $phoneLimpio = VerificarPagoWati::claveIdentificador($phone);
             $marcador    = storage_path('app/verificaciones/' . $phoneLimpio . '.saved');
             if (file_exists($marcador)) {
                 return;

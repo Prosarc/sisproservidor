@@ -76,6 +76,56 @@ class WatiMediaService
         return null;
     }
 
+    /**
+     * Descarga el archivo de un mensaje con la API v3 (/conversations/messages/file/{id}).
+     *
+     * @return array{content: string, extension: string}|null
+     */
+    public static function downloadV3(string $messageId, ?string $textoNombre = null, ?string $type = null): ?array
+    {
+        $token = (string) config('services.wati.token');
+        if ($messageId === '' || $token === '') {
+            return null;
+        }
+
+        $response = Http::withoutVerifying()
+            ->withToken($token)
+            ->withOptions(['allow_redirects' => ['max' => 10]])
+            ->timeout(60)
+            ->get(self::baseV3() . '/api/ext/v3/conversations/messages/file/' . rawurlencode($messageId));
+
+        if (!$response->successful()) {
+            Log::warning('Wati v3 file: respuesta no exitosa', [
+                'message_id' => $messageId,
+                'status'     => $response->status(),
+            ]);
+            return null;
+        }
+
+        $content = $response->body();
+        if (!self::validarContenido($content, $type)) {
+            Log::warning('Wati v3 file: contenido inválido', [
+                'message_id'  => $messageId,
+                'contentType' => $response->header('Content-Type'),
+                'size'        => strlen($content),
+            ]);
+            return null;
+        }
+
+        return [
+            'content'   => $content,
+            'extension' => self::extensionDesdeContenido($content, $type, $textoNombre, $messageId),
+        ];
+    }
+
+    /** La API v3 vive en el host de WATI, sin el id de cuenta que lleva WATI_ENDPOINT. */
+    public static function baseV3(): string
+    {
+        $parts = parse_url((string) config('services.wati.endpoint'));
+
+        return ($parts['scheme'] ?? 'https') . '://' . ($parts['host'] ?? 'live-mt-server.wati.io');
+    }
+
     private static function httpGet(string $url, ?string $token): ?string
     {
         $request = Http::withoutVerifying()
