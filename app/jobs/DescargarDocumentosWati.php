@@ -36,6 +36,13 @@ class DescargarDocumentosWati implements ShouldQueue
         }
 
         $guardados  = 0;
+
+        if (VerificarPagoWati::esBsuid($this->numberPhone)) {
+            $guardados = $this->descargarV3($token);
+            Log::info('Wati descarga completada', ['phone' => $this->numberPhone, 'guardados' => $guardados, 'api' => 'v3']);
+            return;
+        }
+
         $pageNumber = $this->sheet + 1;
         $pageSize   = 20;
         $maxPaginas = 10;
@@ -128,5 +135,94 @@ class DescargarDocumentosWati implements ShouldQueue
             'phone'     => $this->numberPhone,
             'guardados' => $guardados,
         ]);
+    }
+
+    /** Contactos sin teléfono (BSUID): mensajes y archivos por la API v3. */
+    private function descargarV3(string $token): int
+    {
+        $guardados  = 0;
+        $pagina     = $this->sheet + 1;
+        $maxPaginas = 10;
+        $base       = WatiMediaService::baseV3();
+
+        while ($guardados < $this->numberDocument && $maxPaginas-- > 0) {
+            $response = Http::withoutVerifying()
+                ->withToken($token)
+                ->timeout(30)
+                ->get($base . '/api/ext/v3/conversations/' . rawurlencode(trim($this->numberPhone)) . '/messages', [
+                    'page_number' => $pagina,
+                    'page_size'   => 20,
+                ]);
+
+            if (!$response->successful()) {
+                Log::warning('Wati v3 messages falló', [
+                    'target' => $this->numberPhone,
+                    'pagina' => $pagina,
+                    'status' => $response->status(),
+                ]);
+                break;
+            }
+
+            $mensajes = $response->json('message_list') ?? [];
+            if (empty($mensajes)) {
+                break;
+            }
+
+            foreach ($mensajes as $idx => $message) {
+                if ($guardados >= $this->numberDocument) {
+                    break;
+                }
+
+                if (($message['event_type'] ?? 'message') !== 'message') {
+                    continue;
+                }
+
+                $msgTimestamp = (int) ($message['timestamp'] ?? 0);
+                if ($msgTimestamp > 0 && $msgTimestamp < $this->timestampLimite) {
+                    return $guardados;
+                }
+
+                if (($message['owner'] ?? false) === true) {
+                    continue;
+                }
+
+                $type        = strtolower((string) ($message['type'] ?? ''));
+                $id          = (string) ($message['id'] ?? '');
+                $textoNombre = (string) ($message['text'] ?? '');
+
+                if (!in_array($type, ['document', 'image'], true) || $id === '') {
+                    continue;
+                }
+                if (str_contains(strtolower($textoNombre), '.crdownload')) {
+                    continue;
+                }
+
+                $descarga = WatiMediaService::downloadV3($id, $textoNombre, $type);
+                if (!$descarga) {
+                    continue;
+                }
+
+                $ext = $descarga['extension'];
+                if ($textoNombre && preg_match('/\.\w{2,4}$/i', $textoNombre)) {
+                    $nombreBase    = preg_replace('/[^a-zA-Z0-9_\-]/', '_', pathinfo($textoNombre, PATHINFO_FILENAME));
+                    $nombreArchivo = ($nombreBase !== '' ? $nombreBase : time()) . '.' . $ext;
+                } else {
+                    $nombreArchivo = time() . '_' . $pagina . '_' . $idx . '.' . $ext;
+                }
+
+                file_put_contents($this->carpeta . '/' . $nombreArchivo, $descarga['content']);
+
+                Log::info('Wati archivo guardado', [
+                    'archivo' => $nombreArchivo,
+                    'tamaño'  => strlen($descarga['content']),
+                    'tipo'    => $ext,
+                ]);
+                $guardados++;
+            }
+
+            $pagina++;
+        }
+
+        return $guardados;
     }
 }
